@@ -1,63 +1,76 @@
 # SoundboardKeeper
 
-SoundboardKeeper is a Discord bot that prioritizes stable voice keep-alive behavior and adds a per-guild soundboard on top.
+SoundboardKeeper is a voice keeper bot first, with a category-based soundboard layered on top.
 
-It can stay connected to a configured home voice channel with automatic reconnect logic, and it can also play uploaded sounds with slash commands under the sound command group.
+It keeps a configured home voice channel alive per guild with watchdog reconnect logic, and also supports uploaded sound playback with prefix-based categories.
 
-## Features
+## Project Structure
 
-- Keeper mode with per-guild home voice channel tracking
-- Watchdog loop for reconnect and recovery
-- Exponential retry backoff and reconnect storm protection
-- Per-guild soundboard with SQLite metadata storage
-- Sound uploads via slash command attachments
-- Name autocomplete for play, edit, and delete sound actions
-- FFmpeg-based playback with per-sound volume
+```text
+SoundboardKeeper/
+  bot/
+    __init__.py
+    main.py
+    config.py
+    logging_setup.py
+    client.py
+    commands/
+      __init__.py
+      basic.py
+      sound.py
+    services/
+      __init__.py
+      voice_keeper.py
+      sound_store.py
+      playback_manager.py
+    utils/
+      __init__.py
+      filenames.py
+      audio.py
+  data/
+    sounds/
+  bot_main.py
+  .env.example
+  requirements.txt
+```
+
+## Architecture
+
+- bot/main.py: entrypoint, loads env, configures logging, creates and runs bot
+- bot/config.py: typed environment parsing in one place
+- bot/client.py: custom Discord client, shared state, sync flow, startup lifecycle
+- bot/commands/basic.py: join, set_home, leave, status, ping
+- bot/commands/sound.py: slash UX for soundboard commands and autocomplete
+- bot/services/voice_keeper.py: reconnect policy, watchdog loop, keeper safety logic
+- bot/services/sound_store.py: SQLite metadata CRUD, categories, lookups
+- bot/services/playback_manager.py: guild playback locking and post-play behavior
+- bot/utils/audio.py: category derivation and ffmpeg checks
+- bot/utils/filenames.py: extension/path helpers and storage filename generation
 
 ## Requirements
 
 - Python 3.10+
-- FFmpeg available on PATH
-- A Discord bot application with slash command and voice permissions
+- FFmpeg on PATH
+- Discord bot token with slash command and voice permissions
 
-## Tech Stack
-
-- discord.py 2.x
-- python-dotenv
-- PyNaCl for voice support
-- SQLite for sound metadata
-
-## Quick Start
-
-### 1. Clone
-
-```bash
-git clone https://github.com/<your-username>/SoundboardKeeper.git
-cd SoundboardKeeper
-```
-
-### 2. Create and activate a virtual environment
+## Installation
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
-```
-
-### 4. Configure environment
-
-```bash
 cp .env.example .env
 ```
 
-Then edit .env with your values.
+## Run
 
-### 5. Run
+Preferred:
+
+```bash
+python3 -m bot.main
+```
+
+Compatibility entrypoint (still works):
 
 ```bash
 python3 bot_main.py
@@ -67,18 +80,15 @@ python3 bot_main.py
 
 Required:
 
-- BOT_TOKEN: Discord bot token
+- BOT_TOKEN
 
-Keeper and startup:
+Keeper and sync:
 
-- DEFAULT_GUILD_ID: Auto-connect guild on startup, 0 to disable
-- DEFAULT_CHANNEL_ID: Auto-connect voice or stage channel on startup, 0 to disable
-- SYNC_GUILD_IDS: Comma-separated guild IDs for fast slash sync
-- SELF_DEAF: true or false
-- SELF_MUTE: true or false
-
-Reconnect and command sync:
-
+- DEFAULT_GUILD_ID
+- DEFAULT_CHANNEL_ID
+- SYNC_GUILD_IDS
+- SELF_DEAF
+- SELF_MUTE
 - WATCHDOG_INTERVAL_SECONDS
 - CONNECT_RETRY_LIMIT
 - MIN_RECONNECT_INTERVAL_SECONDS
@@ -88,61 +98,54 @@ Reconnect and command sync:
 
 Soundboard:
 
-- SOUNDBOARD_DISCONNECT_AFTER_PLAY: Disconnect after playback when keeper mode is not active
-- SOUNDBOARD_MAX_FILE_SIZE_MB: Max upload size in megabytes
-- SOUNDBOARD_ALLOWED_EXTENSIONS: Comma-separated list such as .mp3,.wav,.ogg,.m4a
-- SOUNDBOARD_STORAGE_DIR: Base folder for uploaded sound files
-- SOUNDBOARD_DB_PATH: SQLite file path for sound metadata
+- SOUNDBOARD_DISCONNECT_AFTER_PLAY
+- SOUNDBOARD_MAX_FILE_SIZE_MB
+- SOUNDBOARD_ALLOWED_EXTENSIONS
+- SOUNDBOARD_STORAGE_DIR (default data/sounds)
+- SOUNDBOARD_DB_PATH
 
 ## Slash Commands
 
-Keeper commands:
+Keeper:
 
-- /join channel: Join or move to a voice or stage channel and track it for keep-alive
-- /set_home channel: Set the home channel for watchdog reconnect behavior
-- /leave: Disconnect and stop keeper tracking for the current server
-- /status: Show tracked state, home channel, and current connection
-- /ping: Health check
+- /join channel
+- /set_home channel
+- /leave
+- /status
+- /ping
 
-Soundboard commands:
+Soundboard:
 
-- /sound add name file volume: Upload and register a sound for this guild
-- /sound play name: Play a saved sound in your current voice or stage channel
-- /sound edit name new_name volume: Update sound metadata
-- /sound delete name: Remove a sound and delete its file
-- /sound list: List sounds available in this guild
+- /sound add name file volume
+- /sound play category name
+- /sound edit name new_name volume
+- /sound delete name
+- /sound list category
+- /sound categories
 
-## Soundboard Notes
+## Category Behavior
 
-- Sound names are case-insensitive for lookup and uniqueness.
-- Duplicate names are rejected within the same guild.
-- Accepted upload extensions are controlled by SOUNDBOARD_ALLOWED_EXTENSIONS.
-- If FFmpeg is missing, playback fails gracefully with an explicit message.
-- If a sound file is missing on disk, users are prompted to re-upload it.
+Category is auto-derived from the first prefix separator in sound name:
 
-## Keeper Mode and Soundboard Interaction
+- meme_vineboom -> meme
+- anime-wow -> anime
+- game:headshot -> game
+- airhorn -> uncategorized
 
-- Keeper mode remains primary when a guild is tracked with a home channel.
-- During active sound playback, watchdog reconnect checks are skipped for that guild to avoid mode conflicts.
-- After playback in keeper-enabled guilds, the bot returns to the home channel if it moved for playback.
-- For non-keeper guilds, post-play behavior uses SOUNDBOARD_DISCONNECT_AFTER_PLAY.
+Supported separators: underscore, hyphen, colon.
 
-## Data Layout
+## Keeper and Playback Safety
 
-- Sound metadata: SQLite table in the file defined by SOUNDBOARD_DB_PATH
-- Uploaded files: SOUNDBOARD_STORAGE_DIR/<guild_id>/<generated_filename>
+- Keeper mode remains primary for tracked guilds.
+- During active sound playback in a guild, watchdog reconnect checks skip that guild to avoid conflicts.
+- After playback in keeper-enabled guilds, bot returns to the configured home channel if it moved.
+- In non-keeper guilds, post-play disconnect behavior follows SOUNDBOARD_DISCONNECT_AFTER_PLAY.
 
-## Troubleshooting
+## Storage
 
-- Commands not appearing: verify SYNC_GUILD_IDS and bot command permissions, then restart.
-- Playback errors: ensure FFmpeg is installed and executable from the bot host.
-- Voice reconnect issues: tune WATCHDOG_INTERVAL_SECONDS and MIN_RECONNECT_INTERVAL_SECONDS.
+- Uploaded files: data/sounds/<guild_id>/<generated_filename>
+- Metadata: SQLite database configured by SOUNDBOARD_DB_PATH
 
 ## License
 
-This project is licensed under GNU GPL v3.0. See LICENSE for details.
-
-## Security
-
-- Never commit real .env secrets.
-- Rotate BOT_TOKEN immediately if exposed.
+GPL-3.0
