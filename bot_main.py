@@ -1,8 +1,14 @@
 import asyncio
 import contextlib
+import datetime as dt
 import logging
 import os
+import shutil
+import sqlite3
 import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
 import discord
@@ -39,8 +45,309 @@ PURGE_GLOBAL_COMMANDS_ON_GUILD_SYNC = os.getenv(
     "PURGE_GLOBAL_COMMANDS_ON_GUILD_SYNC", "true"
 ).lower() == "true"
 
+SOUNDBOARD_DISCONNECT_AFTER_PLAY = os.getenv(
+    "SOUNDBOARD_DISCONNECT_AFTER_PLAY", "true"
+).lower() == "true"
+SOUNDBOARD_MAX_FILE_SIZE_MB = int(os.getenv("SOUNDBOARD_MAX_FILE_SIZE_MB", "10"))
+SOUNDBOARD_ALLOWED_EXTENSIONS = tuple(
+    ext.strip().lower() if ext.strip().startswith(".") else f".{ext.strip().lower()}"
+    for ext in os.getenv("SOUNDBOARD_ALLOWED_EXTENSIONS", ".mp3,.wav,.ogg,.m4a").split(",")
+    if ext.strip()
+)
+SOUNDBOARD_STORAGE_DIR = os.getenv("SOUNDBOARD_STORAGE_DIR", "sounds")
+SOUNDBOARD_DB_PATH = os.getenv("SOUNDBOARD_DB_PATH", "soundboard.sqlite3")
+
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN (or TOKEN) in environment.")
+
+
+@dataclass(frozen=True)
+class SoundRecord:
+    guild_id: int
+    name: str
+    name_key: str
+    file_path: str
+    volume: int
+    uploader_user_id: int
+    created_at: str
+
+
+def normalize_sound_name(name: str) -> str:
+    return " ".join(name.split()).strip()
+
+
+def sound_name_key(name: str) -> str:
+    return normalize_sound_name(name).casefold()
+
+
+class SoundStore:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = Path(db_path)
+        if self.db_path.parent != Path(""):
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sounds (
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                name_key TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                volume INTEGER NOT NULL,
+                uploader_user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, name_key)
+            )
+            """
+        )
+        self._conn.commit()
+
+    def add_sound(
+        self,
+        *,
+        guild_id: int,
+        name: str,
+        file_path: str,
+        volume: int,
+        uploader_user_id: int,
+    ) -> SoundRecord:
+        clean_name = normalize_sound_name(name)
+        key = sound_name_key(clean_name)
+        created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO sounds (guild_id, name, name_key, file_path, volume, uploader_user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (guild_id, clean_name, key, file_path, volume, uploader_user_id, created_at),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError as err:
+            raise ValueError("duplicate") from err
+
+        return SoundRecord(
+            guild_id=guild_id,
+            name=clean_name,
+            name_key=key,
+            file_path=file_path,
+            volume=volume,
+            uploader_user_id=uploader_user_id,
+            created_at=created_at,
+        )
+
+    def get_sound(self, guild_id: int, name: str) -> Optional[SoundRecord]:
+        key = sound_name_key(name)
+        row = self._conn.execute(
+            """
+            SELECT guild_id, name, name_key, file_path, volume, uploader_user_id, created_at
+            FROM sounds
+            WHERE guild_id = ? AND name_key = ?
+            """,
+            (guild_id, key),
+        ).fetchone()
+        return self._row_to_record(row)
+
+    def list_sounds(self, guild_id: int) -> list[SoundRecord]:
+        rows = self._conn.execute(
+            """
+            SELECT guild_id, name, name_key, file_path, volume, uploader_user_id, created_at
+            FROM sounds
+            WHERE guild_id = ?
+            ORDER BY name COLLATE NOCASE ASC
+            """,
+            (guild_id,),
+        ).fetchall()
+        return [self._row_to_record(row) for row in rows if row is not None]
+
+    def search_names(self, guild_id: int, query: str, limit: int = 25) -> list[str]:
+        pattern = f"%{query.strip().casefold()}%"
+        rows = self._conn.execute(
+            """
+            SELECT name
+            FROM sounds
+            WHERE guild_id = ? AND name_key LIKE ?
+            ORDER BY name COLLATE NOCASE ASC
+            LIMIT ?
+            """,
+            (guild_id, pattern, max(1, limit)),
+        ).fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def update_sound(
+        self,
+        guild_id: int,
+        name: str,
+        *,
+        new_name: Optional[str],
+        new_volume: Optional[int],
+    ) -> SoundRecord:
+        current = self.get_sound(guild_id, name)
+        if current is None:
+            raise KeyError("missing")
+
+        target_name = normalize_sound_name(new_name) if new_name is not None else current.name
+        target_key = sound_name_key(target_name)
+        target_volume = current.volume if new_volume is None else new_volume
+
+        if target_key != current.name_key:
+            existing = self.get_sound(guild_id, target_name)
+            if existing is not None:
+                raise ValueError("duplicate")
+
+        self._conn.execute(
+            """
+            UPDATE sounds
+            SET name = ?, name_key = ?, volume = ?
+            WHERE guild_id = ? AND name_key = ?
+            """,
+            (target_name, target_key, target_volume, guild_id, current.name_key),
+        )
+        self._conn.commit()
+
+        updated = self.get_sound(guild_id, target_name)
+        if updated is None:
+            raise RuntimeError("failed to fetch updated sound")
+        return updated
+
+    def delete_sound(self, guild_id: int, name: str) -> Optional[SoundRecord]:
+        current = self.get_sound(guild_id, name)
+        if current is None:
+            return None
+
+        self._conn.execute(
+            """
+            DELETE FROM sounds
+            WHERE guild_id = ? AND name_key = ?
+            """,
+            (guild_id, current.name_key),
+        )
+        self._conn.commit()
+        return current
+
+    @staticmethod
+    def _row_to_record(row: Optional[sqlite3.Row]) -> Optional[SoundRecord]:
+        if row is None:
+            return None
+        return SoundRecord(
+            guild_id=int(row["guild_id"]),
+            name=str(row["name"]),
+            name_key=str(row["name_key"]),
+            file_path=str(row["file_path"]),
+            volume=int(row["volume"]),
+            uploader_user_id=int(row["uploader_user_id"]),
+            created_at=str(row["created_at"]),
+        )
+
+
+class PlaybackManager:
+    def __init__(self, bot: "VoiceKeeperBot") -> None:
+        self.bot = bot
+        self.guild_play_locks: Dict[int, asyncio.Lock] = {}
+
+    def _get_play_lock(self, guild_id: int) -> asyncio.Lock:
+        lock = self.guild_play_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.guild_play_locks[guild_id] = lock
+        return lock
+
+    async def play_sound_in_channel(
+        self,
+        *,
+        guild: discord.Guild,
+        target_channel: discord.VoiceChannel | discord.StageChannel,
+        sound: SoundRecord,
+    ) -> Tuple[bool, str]:
+        guild_id = guild.id
+        lock = self._get_play_lock(guild_id)
+
+        async with lock:
+            self.bot.active_playback_guilds.add(guild_id)
+            try:
+                async with self.bot._get_connect_lock(guild_id):
+                    ok, msg = await self.bot.connect_to_channel(guild_id, target_channel.id)
+                if not ok:
+                    return False, msg
+
+                voice_client = guild.voice_client
+                if voice_client is None or not voice_client.is_connected():
+                    return False, "Voice connection failed to initialize."
+
+                if voice_client.is_playing():
+                    voice_client.stop()
+
+                source = discord.FFmpegPCMAudio(sound.file_path)
+                source = discord.PCMVolumeTransformer(source, volume=max(0.0, sound.volume / 100.0))
+
+                loop = asyncio.get_running_loop()
+                finished = asyncio.Event()
+                playback_error: Dict[str, str] = {}
+
+                def after_play(err: Optional[Exception]) -> None:
+                    if err is not None:
+                        playback_error["error"] = str(err)
+                    loop.call_soon_threadsafe(finished.set)
+
+                try:
+                    voice_client.play(source, after=after_play)
+                except Exception as err:  # noqa: BLE001
+                    logger.exception("Failed to start playback in guild %s: %s", guild_id, err)
+                    return False, f"Unable to start playback: {err}"
+
+                await finished.wait()
+
+                if playback_error:
+                    return False, f"Playback error: {playback_error['error']}"
+
+                await self._post_playback_cleanup(guild)
+                return True, f"Played **{sound.name}**."
+            finally:
+                self.bot.active_playback_guilds.discard(guild_id)
+
+    async def _post_playback_cleanup(self, guild: discord.Guild) -> None:
+        guild_id = guild.id
+        voice_client = guild.voice_client
+        if voice_client is None or not voice_client.is_connected():
+            return
+
+        keeper_enabled = guild_id in self.bot.tracked_guilds and guild_id in self.bot.home_channels
+        if keeper_enabled:
+            home_channel_id = self.bot.home_channels[guild_id]
+            if voice_client.channel and voice_client.channel.id != home_channel_id:
+                async with self.bot._get_connect_lock(guild_id):
+                    ok, msg = await self.bot.connect_to_channel(guild_id, home_channel_id)
+                if ok:
+                    logger.info("[guild=%s] Returned to keeper home after playback.", guild_id)
+                else:
+                    logger.warning("[guild=%s] Could not return to keeper home: %s", guild_id, msg)
+            return
+
+        if SOUNDBOARD_DISCONNECT_AFTER_PLAY:
+            with contextlib.suppress(Exception):
+                await voice_client.disconnect(force=True)
+
+
+def extension_from_filename(filename: str) -> str:
+    return Path(filename).suffix.lower()
+
+
+def make_storage_filename(original_filename: str) -> str:
+    ext = extension_from_filename(original_filename)
+    return f"{uuid.uuid4().hex}{ext}"
+
+
+def is_safe_child_path(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class VoiceKeeperBot(discord.Client):
@@ -57,6 +364,12 @@ class VoiceKeeperBot(discord.Client):
         self.guild_connect_locks: Dict[int, asyncio.Lock] = {}
         self.last_connect_attempt: Dict[int, float] = {}
         self.last_voice_disconnect: Dict[int, float] = {}
+        self.active_playback_guilds: Set[int] = set()
+
+        self.sound_storage_dir = Path(SOUNDBOARD_STORAGE_DIR)
+        self.sound_storage_dir.mkdir(parents=True, exist_ok=True)
+        self.sound_store = SoundStore(SOUNDBOARD_DB_PATH)
+        self.playback_manager = PlaybackManager(self)
 
     def _get_connect_lock(self, guild_id: int) -> asyncio.Lock:
         lock = self.guild_connect_locks.get(guild_id)
@@ -166,6 +479,9 @@ class VoiceKeeperBot(discord.Client):
     async def ensure_connected(self, guild_id: int) -> None:
         channel_id = self.home_channels.get(guild_id)
         if not channel_id:
+            return
+
+        if guild_id in self.active_playback_guilds:
             return
 
         guild = self.get_guild(guild_id)
@@ -306,6 +622,286 @@ def setup_commands(tree: app_commands.CommandTree, bot: VoiceKeeperBot) -> None:
     @tree.command(name="ping", description="Bot health check.")
     async def ping_command(interaction: discord.Interaction):
         await interaction.response.send_message(f"Pong: {round(bot.latency * 1000)} ms", ephemeral=True)
+
+    sound_group = app_commands.Group(name="sound", description="Per-guild soundboard commands")
+
+    async def sound_name_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        guild = interaction.guild
+        if guild is None:
+            return []
+        names = bot.sound_store.search_names(guild.id, current, limit=25)
+        return [app_commands.Choice(name=name, value=name) for name in names]
+
+    @sound_group.command(name="add", description="Upload and save a new guild sound.")
+    @app_commands.describe(name="Sound name", file="Audio file", volume="Volume percent (1-200)")
+    async def sound_add_command(
+        interaction: discord.Interaction,
+        name: str,
+        file: discord.Attachment,
+        volume: Optional[int] = 100,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+            return
+
+        clean_name = normalize_sound_name(name)
+        if not clean_name:
+            await interaction.response.send_message("Sound name cannot be empty.", ephemeral=True)
+            return
+
+        if volume is None:
+            volume = 100
+        if volume < 1 or volume > 200:
+            await interaction.response.send_message("Volume must be between 1 and 200.", ephemeral=True)
+            return
+
+        ext = extension_from_filename(file.filename)
+        if ext not in SOUNDBOARD_ALLOWED_EXTENSIONS:
+            allowed = ", ".join(SOUNDBOARD_ALLOWED_EXTENSIONS)
+            await interaction.response.send_message(
+                f"Unsupported file type. Allowed: {allowed}",
+                ephemeral=True,
+            )
+            return
+
+        max_bytes = max(1, SOUNDBOARD_MAX_FILE_SIZE_MB) * 1024 * 1024
+        if file.size > max_bytes:
+            await interaction.response.send_message(
+                f"File is too large. Max size is {SOUNDBOARD_MAX_FILE_SIZE_MB} MB.",
+                ephemeral=True,
+            )
+            return
+
+        if bot.sound_store.get_sound(guild.id, clean_name) is not None:
+            await interaction.response.send_message(
+                f"A sound named **{clean_name}** already exists in this server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild_dir = bot.sound_storage_dir / str(guild.id)
+        guild_dir.mkdir(parents=True, exist_ok=True)
+        saved_path = guild_dir / make_storage_filename(file.filename)
+
+        try:
+            with saved_path.open("wb") as fp:
+                await file.save(fp)
+
+            bot.sound_store.add_sound(
+                guild_id=guild.id,
+                name=clean_name,
+                file_path=str(saved_path),
+                volume=volume,
+                uploader_user_id=interaction.user.id,
+            )
+        except ValueError:
+            with contextlib.suppress(Exception):
+                saved_path.unlink(missing_ok=True)
+            await interaction.followup.send(
+                f"A sound named **{clean_name}** already exists in this server.",
+                ephemeral=True,
+            )
+            return
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Failed to add sound in guild %s: %s", guild.id, err)
+            with contextlib.suppress(Exception):
+                saved_path.unlink(missing_ok=True)
+            await interaction.followup.send(
+                f"Failed to save sound: {err}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"Saved sound **{clean_name}** at {volume}% volume.",
+            ephemeral=True,
+        )
+
+    @sound_group.command(name="play", description="Play a saved sound in your voice channel.")
+    @app_commands.describe(name="Sound name")
+    @app_commands.autocomplete(name=sound_name_autocomplete)
+    async def sound_play_command(interaction: discord.Interaction, name: str):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+            return
+
+        if shutil.which("ffmpeg") is None:
+            await interaction.response.send_message(
+                "FFmpeg is not installed or not in PATH. Install FFmpeg to use sound playback.",
+                ephemeral=True,
+            )
+            return
+
+        sound = bot.sound_store.get_sound(guild.id, name)
+        if sound is None:
+            await interaction.response.send_message(
+                f"No sound named **{normalize_sound_name(name)}** was found.",
+                ephemeral=True,
+            )
+            return
+
+        sound_path = Path(sound.file_path)
+        if not sound_path.exists():
+            await interaction.response.send_message(
+                "This sound file is missing on disk. Delete and re-upload it.",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None or member.voice is None or member.voice.channel is None:
+            await interaction.response.send_message(
+                "Join a voice or stage channel first.",
+                ephemeral=True,
+            )
+            return
+
+        target_channel = member.voice.channel
+        if not isinstance(target_channel, discord.VoiceChannel | discord.StageChannel):
+            await interaction.response.send_message(
+                "Join a voice or stage channel first.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok, msg = await bot.playback_manager.play_sound_in_channel(
+            guild=guild,
+            target_channel=target_channel,
+            sound=sound,
+        )
+
+        if ok:
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.followup.send(f"Error: {msg}", ephemeral=True)
+
+    @sound_group.command(name="edit", description="Edit sound metadata.")
+    @app_commands.describe(
+        name="Existing sound name",
+        new_name="New sound name",
+        volume="New volume percent (1-200)",
+    )
+    @app_commands.autocomplete(name=sound_name_autocomplete)
+    async def sound_edit_command(
+        interaction: discord.Interaction,
+        name: str,
+        new_name: Optional[str] = None,
+        volume: Optional[int] = None,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+            return
+
+        if new_name is None and volume is None:
+            await interaction.response.send_message(
+                "Provide at least one field to edit.",
+                ephemeral=True,
+            )
+            return
+
+        normalized_new_name: Optional[str] = None
+        if new_name is not None:
+            normalized_new_name = normalize_sound_name(new_name)
+            if not normalized_new_name:
+                await interaction.response.send_message("New name cannot be empty.", ephemeral=True)
+                return
+
+        if volume is not None and (volume < 1 or volume > 200):
+            await interaction.response.send_message("Volume must be between 1 and 200.", ephemeral=True)
+            return
+
+        try:
+            updated = bot.sound_store.update_sound(
+                guild.id,
+                name,
+                new_name=normalized_new_name,
+                new_volume=volume,
+            )
+        except KeyError:
+            await interaction.response.send_message("Sound not found.", ephemeral=True)
+            return
+        except ValueError:
+            await interaction.response.send_message(
+                "A sound with that new name already exists.",
+                ephemeral=True,
+            )
+            return
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Failed to edit sound in guild %s: %s", guild.id, err)
+            await interaction.response.send_message(f"Failed to edit sound: {err}", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"Updated **{updated.name}** (volume: {updated.volume}%).",
+            ephemeral=True,
+        )
+
+    @sound_group.command(name="delete", description="Delete a saved sound.")
+    @app_commands.describe(name="Existing sound name")
+    @app_commands.autocomplete(name=sound_name_autocomplete)
+    async def sound_delete_command(interaction: discord.Interaction, name: str):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+            return
+
+        try:
+            removed = bot.sound_store.delete_sound(guild.id, name)
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Failed to delete sound metadata in guild %s: %s", guild.id, err)
+            await interaction.response.send_message(f"Failed to delete sound: {err}", ephemeral=True)
+            return
+
+        if removed is None:
+            await interaction.response.send_message("Sound not found.", ephemeral=True)
+            return
+
+        file_path = Path(removed.file_path)
+        if is_safe_child_path(file_path, bot.sound_storage_dir):
+            with contextlib.suppress(Exception):
+                file_path.unlink(missing_ok=True)
+
+        await interaction.response.send_message(
+            f"Deleted sound **{removed.name}**.",
+            ephemeral=True,
+        )
+
+    @sound_group.command(name="list", description="List available sounds in this server.")
+    async def sound_list_command(interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+            return
+
+        sounds = bot.sound_store.list_sounds(guild.id)
+        if not sounds:
+            await interaction.response.send_message("No sounds saved for this server yet.", ephemeral=True)
+            return
+
+        max_lines = 25
+        visible = sounds[:max_lines]
+        lines = [f"- **{sound.name}** ({sound.volume}%)" for sound in visible]
+        if len(sounds) > max_lines:
+            lines.append(f"...and {len(sounds) - max_lines} more")
+
+        embed = discord.Embed(
+            title=f"Soundboard ({len(sounds)} sounds)",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    tree.add_command(sound_group)
 
 
 if __name__ == "__main__":
