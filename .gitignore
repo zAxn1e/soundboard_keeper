@@ -75,3 +75,6 @@ dmypy.json
 .env.local
 .env.development
 .env.production
+
+# dynamic
+sounds/*
