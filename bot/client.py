@@ -118,6 +118,14 @@ class KeeperSoundBot(discord.Client):
     ) -> None:
         await self.voice_keeper.handle_voice_state_update(member, before, after)
 
+    async def on_resumed(self) -> None:
+        logger.info("Gateway session resumed; checking tracked voice connections.")
+        for guild_id in list(self.tracked_guilds):
+            asyncio.create_task(
+                self.voice_keeper.ensure_connected(guild_id),
+                name=f"voice-resume-check-{guild_id}",
+            )
+
     async def close(self) -> None:
         if self.watchdog_task:
             self.watchdog_task.cancel()

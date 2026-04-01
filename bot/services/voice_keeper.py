@@ -19,6 +19,28 @@ class VoiceKeeperService:
     def __init__(self, bot: "KeeperSoundBot") -> None:
         self.bot = bot
 
+    @staticmethod
+    def _is_voice_client_reconnecting(vc: discord.VoiceClient) -> bool:
+        return bool(
+            getattr(vc, "_reconnecting", False)
+            or getattr(vc, "_potentially_reconnecting", False)
+            or getattr(vc, "_handshaking", False)
+        )
+
+    @staticmethod
+    def _is_voice_client_healthy(vc: discord.VoiceClient | None, *, expected_channel_id: int) -> bool:
+        if vc is None or not vc.is_connected() or vc.channel is None:
+            return False
+
+        if vc.channel.id != expected_channel_id:
+            return False
+
+        ws = getattr(vc, "ws", None)
+        if ws is not None and getattr(ws, "closed", False):
+            return False
+
+        return True
+
     async def connect_to_channel(self, guild_id: int, channel_id: int) -> tuple[bool, str]:
         self.bot.last_connect_attempt[guild_id] = time.monotonic()
 
@@ -37,13 +59,20 @@ class VoiceKeeperService:
             await existing.move_to(channel)
             return True, f"Moved to {channel.mention}."
 
+        # A stale voice client can linger after dropped websocket sessions.
+        # Disconnecting it first avoids "already connected" / timeout loops.
+        if existing is not None:
+            with contextlib.suppress(Exception):
+                await existing.disconnect(force=False)
+            await asyncio.sleep(0.2)
+
         delay = 2
         for attempt in range(1, self.bot.config.connect_retry_limit + 1):
             try:
                 await channel.connect(
                     self_deaf=self.bot.config.self_deaf,
                     self_mute=self.bot.config.self_mute,
-                    reconnect=False,
+                    reconnect=True,
                 )
                 return True, f"Connected to {channel.mention}."
             except Exception as err:
@@ -70,14 +99,10 @@ class VoiceKeeperService:
         async with self.bot.get_connect_lock(guild_id):
             vc = guild.voice_client
 
-            if vc and vc.is_connected() and vc.channel and vc.channel.id == channel_id:
+            if self._is_voice_client_healthy(vc, expected_channel_id=channel_id):
                 return
 
-            if vc and (
-                getattr(vc, "_reconnecting", False)
-                or getattr(vc, "_potentially_reconnecting", False)
-                or getattr(vc, "_handshaking", False)
-            ):
+            if vc and self._is_voice_client_reconnecting(vc):
                 return
 
             last_drop = self.bot.last_voice_disconnect.get(guild_id, 0.0)
@@ -90,7 +115,7 @@ class VoiceKeeperService:
 
             if vc and not vc.is_connected():
                 with contextlib.suppress(Exception):
-                    await vc.disconnect(force=True)
+                    await vc.disconnect(force=False)
 
             ok, msg = await self.connect_to_channel(guild_id, channel_id)
             if ok:
