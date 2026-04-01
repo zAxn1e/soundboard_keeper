@@ -33,6 +33,7 @@ SYNC_GUILD_IDS = [
 WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "20"))
 CONNECT_RETRY_LIMIT = int(os.getenv("CONNECT_RETRY_LIMIT", "4"))
 MIN_RECONNECT_INTERVAL_SECONDS = int(os.getenv("MIN_RECONNECT_INTERVAL_SECONDS", "12"))
+VOICE_RECOVERY_GRACE_SECONDS = int(os.getenv("VOICE_RECOVERY_GRACE_SECONDS", "35"))
 COMMAND_SYNC_TIMEOUT_SECONDS = int(os.getenv("COMMAND_SYNC_TIMEOUT_SECONDS", "30"))
 PURGE_GLOBAL_COMMANDS_ON_GUILD_SYNC = os.getenv(
     "PURGE_GLOBAL_COMMANDS_ON_GUILD_SYNC", "true"
@@ -55,6 +56,7 @@ class VoiceKeeperBot(discord.Client):
         self.watchdog_task: Optional[asyncio.Task] = None
         self.guild_connect_locks: Dict[int, asyncio.Lock] = {}
         self.last_connect_attempt: Dict[int, float] = {}
+        self.last_voice_disconnect: Dict[int, float] = {}
 
     def _get_connect_lock(self, guild_id: int) -> asyncio.Lock:
         lock = self.guild_connect_locks.get(guild_id)
@@ -149,7 +151,8 @@ class VoiceKeeperBot(discord.Client):
         delay = 2
         for attempt in range(1, CONNECT_RETRY_LIMIT + 1):
             try:
-                await channel.connect(self_deaf=SELF_DEAF, self_mute=SELF_MUTE, reconnect=True)
+                # Keep reconnect ownership in watchdog to avoid overlapping reconnect loops.
+                await channel.connect(self_deaf=SELF_DEAF, self_mute=SELF_MUTE, reconnect=False)
                 return True, f"Connected to {channel.mention}."
             except Exception as err:  # noqa: BLE001
                 logger.warning("Connect attempt %s failed for guild %s: %s", attempt, guild_id, err)
@@ -176,6 +179,19 @@ class VoiceKeeperBot(discord.Client):
             if vc and vc.is_connected() and vc.channel and vc.channel.id == channel_id:
                 return
 
+            # Let discord.py finish in-progress voice recovery before we force anything.
+            if vc and (
+                getattr(vc, "_reconnecting", False)
+                or getattr(vc, "_potentially_reconnecting", False)
+                or getattr(vc, "_handshaking", False)
+            ):
+                return
+
+            # If a disconnect happened very recently, give voice state recovery a short grace window.
+            last_drop = self.last_voice_disconnect.get(guild_id, 0)
+            if time.monotonic() - last_drop < VOICE_RECOVERY_GRACE_SECONDS:
+                return
+
             # Avoid reconnect storms while discord.py is already recovering.
             last_attempt = self.last_connect_attempt.get(guild_id, 0)
             if time.monotonic() - last_attempt < MIN_RECONNECT_INTERVAL_SECONDS:
@@ -191,6 +207,19 @@ class VoiceKeeperBot(discord.Client):
                 logger.info("[guild=%s] %s", guild_id, msg)
             else:
                 logger.warning("[guild=%s] %s", guild_id, msg)
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if not self.user or member.id != self.user.id:
+            return
+
+        # Track bot-side drops so watchdog can avoid colliding with built-in recovery.
+        if before.channel is not None and after.channel is None and member.guild:
+            self.last_voice_disconnect[member.guild.id] = time.monotonic()
 
     async def voice_watchdog(self) -> None:
         await self.wait_until_ready()
