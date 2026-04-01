@@ -68,10 +68,10 @@ dmypy.json
 # Ruff / lint cache
 .ruff_cache/
 
-# SQLite (ถ้ามี)
+# SQLite
 *.sqlite3
 
-# dotenv (เผื่อ)
+# dotenv
 .env.local
 .env.development
 .env.production
